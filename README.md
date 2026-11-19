@@ -43,6 +43,8 @@ pytest                 # 运行测试
 |---|---|---|
 | `POST` | `/v1/init` | 首次提交：区域 + 宗地 + 井 → 版本 1（仅允许一次） |
 | `PUT` | `/v1/parcels` | 携带 `base_revision` 整批替换指定宗地，成功后发布新版本 |
+| `POST` | `/v1/alignment` | 对齐发布：当前版本 → 外业平面格网对齐副本 |
+| `GET` | `/v1/alignment` | 查询当前对齐副本（含所用修订号、控制点、格网间距） |
 | `GET` | `/v1/current` | 当前完整版本：区域 + 边界 + 井归属（同一读事务取出） |
 | `GET` | `/v1/parcels` | 当前宗地边界（响应带 `revision`） |
 | `GET` | `/v1/wells` | 当前井归属（响应带 `revision`，可与边界响应对号验证同版） |
@@ -114,6 +116,62 @@ curl -X PUT http://localhost:8000/v1/parcels -H 'Content-Type: application/json'
 `base_revision` 与当前版本不一致（含提交期间被他人抢先发布）时返回 409，
 响应携带当前修订号，客户端重新读取后可基于新版重试。
 
+## 对齐发布（外业平面格网）
+
+外业系统用自己的平面格网接收宗地图和采样井。`POST /v1/alignment` 把当前
+版本对齐到外业格网并发布为**对齐副本**（只保留最新一份，整体替换）：
+
+```bash
+curl -X POST http://localhost:8000/v1/alignment -H 'Content-Type: application/json' -d '{
+  "base_revision": 1,
+  "control_points": [
+    {"source": [0, 0],   "target": [10, 20]},
+    {"source": [100, 0], "target": [110, 20]},
+    {"source": [0, 100], "target": [10, 120]}
+  ],
+  "grid_spacing": 1
+}'
+# => {"source_revision":1,"grid_spacing":1,"parcel_count":2,"well_count":3,
+#     "well_summary":{"assigned":1,"pending":1,"uncovered":1}}
+```
+
+规则：
+
+- **控制点**：恰好三对（源 / 目标），两侧三点各自**不共线**，据此唯一确定
+  仿射变换 `t = A·s + b`；共线或退化为一点 → 422 `invalid_control_points`。
+- **格网间距**：正整数。区域、宗地、井先经仿射变换到目标平面，再把每个
+  坐标吸附到以目标坐标原点为起点、间距为 `grid_spacing` 的最近格点；
+  **每轴同距时取较小值**（如间距 5 时 2.5 → 0、-2.5 → -5）。吸附后坐标
+  必为整数，复用原有整数坐标边界核查。
+- **对齐副本核查**（任一不满足即整体拒绝，返回 422 并指明涉及的宗地或井）：
+  1. 原有边界有效性与覆盖核查（无洞、有效、在区域内、互不重叠、恰好覆盖）；
+  2. 所有宗地对的两两**接触类型**（不接触 / 点接触 / 共边）与源版一致
+     （`contact_type_changed`，携带 `parcel_ids` 与两侧接触类型）；
+  3. 每口井的**归属状态与候选宗地**与源版一致
+     （`well_attribution_changed`，携带 `well_id` 与两侧归属）。
+- **源版照常发布**：对齐计算在写事务之外基于源版快照进行，期间
+  `PUT /v1/parcels` 等发布流程不受阻塞；若提交对齐结果时源修订已变更，
+  本次对齐作废并返回 409。
+- **失败不影响供数**：校验失败、源修订变更或保存失败时，原有对齐副本
+  继续供数；副本的 meta、宗地、井在同一个事务里整体替换，失败即回滚。
+
+`GET /v1/alignment` 返回完整对齐副本及所用修订号、控制点、格网间距：
+
+```json
+{
+  "source_revision": 1,
+  "control_points": [{"source": [0.0, 0.0], "target": [10.0, 20.0]}, ...],
+  "grid_spacing": 1,
+  "created_at": "...",
+  "region": {...},
+  "parcels": [{"id": "P1", "geometry": {...}}, ...],
+  "wells": [{"id": "W1", "geometry": {...}, "status": "assigned",
+             "parcel_id": "P1", "candidates": ["P1"]}, ...]
+}
+```
+
+未发布过对齐副本时返回 404 `no_alignment`。
+
 ## 并发与原子性设计
 
 - **同版并发修订只成功一份**：几何核查与井归属重算在写事务外基于快照完成；
@@ -126,6 +184,10 @@ curl -X PUT http://localhost:8000/v1/parcels -H 'Content-Type: application/json'
 - **同版一致性**：`/v1/current` 在单个读事务（WAL 快照）中取出边界与井归属；
   单独调用 `/v1/parcels` 与 `/v1/wells` 时比较两个响应的 `revision`
   即可确认是否同版。
+- **对齐副本原子替换**：对齐计算（仿射变换、格点吸附、一致性核查）在写事务
+  之外完成；提交时 `BEGIN IMMEDIATE` 串行化，先核对源修订号未变，再在同一
+  事务里整体替换对齐副本（meta + 宗地 + 井），中途失败即回滚，查询端永远
+  读到上一份完整副本。
 
 ## 项目结构
 
@@ -133,8 +195,10 @@ curl -X PUT http://localhost:8000/v1/parcels -H 'Content-Type: application/json'
 app/
   main.py      # FastAPI 入口与端点
   geo.py       # 几何校验、覆盖核查、井归属计算（Shapely）
+  align.py     # 仿射变换、格点吸附、接触类型与归属一致性核查
   db.py        # SQLite 连接、建表、启动清理
   schemas.py   # 请求模型（Pydantic）
-tests/test_api.py
+tests/test_api.py        # 版本化发布与井归属
+tests/test_alignment.py  # 对齐发布
 Dockerfile / docker-compose.yml
 ```

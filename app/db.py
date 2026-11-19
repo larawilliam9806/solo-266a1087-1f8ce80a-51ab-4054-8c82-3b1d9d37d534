@@ -56,6 +56,30 @@ CREATE TABLE IF NOT EXISTS well_attributions (
     candidates TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (revision, well_id)
 );
+
+-- 对齐副本（外业平面格网）：只保留最新一份成功发布的，整体替换。
+-- meta 行与 parcels/wells 行在同一个事务里写入，失败即回滚，旧副本继续供数。
+CREATE TABLE IF NOT EXISTS alignment_meta (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    source_revision INTEGER NOT NULL,
+    control_points  TEXT NOT NULL,
+    grid_spacing    INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    region          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alignment_parcels (
+    parcel_id TEXT PRIMARY KEY,
+    geojson   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alignment_wells (
+    well_id    TEXT PRIMARY KEY,
+    geojson    TEXT NOT NULL,
+    status     TEXT NOT NULL CHECK (status IN ('assigned', 'pending', 'uncovered')),
+    parcel_id  TEXT,
+    candidates TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 

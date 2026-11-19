@@ -1,10 +1,12 @@
-"""FastAPI 入口：版本化发布、整批替换、同版一致性查询。
+"""FastAPI 入口：版本化发布、整批替换、同版一致性查询、外业格网对齐发布。
 
 并发与原子性：
-- 重活（几何核查、井归属重算）在写事务之外基于 base 版本快照完成；
+- 重活（几何核查、井归属重算、对齐计算）在写事务之外基于 base 版本快照完成；
 - 写事务用 BEGIN IMMEDIATE 串行化，进入后先核对 meta.current_revision
   仍等于 base_revision，不等则回滚返回 409 —— 同版并发修订只成功一份；
 - 版本行、宗地行、井归属行、版本指针在同一个事务里提交，失败/重启不留半版。
+- 对齐副本（meta + 宗地 + 井）也在同一个事务里整体替换：对齐计算期间源版
+  可照常发布；提交时源修订已变更、或校验/保存失败，原有对齐副本继续供数。
 """
 from __future__ import annotations
 
@@ -17,9 +19,11 @@ from typing import Any, Optional
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from .align import (collinear_reason, compare_attributions, compare_contact_types,
+                    solve_affine, transform_point_geojson, transform_polygon_geojson)
 from .db import connect, init_db
 from .geo import attribute_wells, parse_point, parse_polygon, validate_tiling
-from .schemas import InitRequest, ReplaceRequest
+from .schemas import AlignRequest, InitRequest, ReplaceRequest
 
 
 @asynccontextmanager
@@ -148,6 +152,15 @@ def _parse_parcels(items, reasons: list[dict]) -> tuple[dict[str, Any], dict[str
             geoms[p.id] = geom
             geojson_by_id[p.id] = p.geometry
     return geoms, geojson_by_id
+
+
+def _revision_conflict(current: int, base: int, message: str) -> JSONResponse:
+    return _err(409, {
+        "error": "revision_conflict",
+        "message": message,
+        "current_revision": current,
+        "base_revision": base,
+    })
 
 
 # ---------------------------------------------------------------- 首次提交
@@ -316,6 +329,211 @@ def replace_parcels(req: ReplaceRequest):
 
     return {"revision": new_revision, "parcel_count": len(new_parcel_gj),
             "well_count": len(well_gj), "well_summary": _well_summary(attributions)}
+
+
+# ---------------------------------------------------------------- 对齐发布（外业平面格网）
+
+def _alignment_validation_error(reasons: list[dict], *,
+                                tiling=None) -> JSONResponse:
+    return _err(422, {
+        "error": "alignment_validation_failed",
+        "message": "对齐副本未通过核查，原有对齐副本继续供数",
+        "gap_area": tiling.gap_area if tiling else None,
+        "overlaps": tiling.overlaps if tiling else [],
+        "overlap_parcel_ids": tiling.overlap_parcel_ids if tiling else [],
+        "reasons": reasons,
+    })
+
+
+def _save_alignment(conn: sqlite3.Connection, req: AlignRequest,
+                    control_points: list[dict], region: dict,
+                    parcels: dict[str, dict], wells: dict[str, dict],
+                    attributions: dict[str, dict]) -> None:
+    """在已开启的事务内整体替换对齐副本（先删后插，同事务原子生效）。"""
+    conn.execute("DELETE FROM alignment_wells")
+    conn.execute("DELETE FROM alignment_parcels")
+    conn.execute("DELETE FROM alignment_meta")
+    conn.execute(
+        "INSERT INTO alignment_meta "
+        "(id, source_revision, control_points, grid_spacing, created_at, region) "
+        "VALUES (1, ?, ?, ?, ?, ?)",
+        (req.base_revision, json.dumps(control_points), req.grid_spacing,
+         _now(), json.dumps(region)),
+    )
+    conn.executemany(
+        "INSERT INTO alignment_parcels (parcel_id, geojson) VALUES (?, ?)",
+        [(pid, json.dumps(g)) for pid, g in parcels.items()],
+    )
+    conn.executemany(
+        "INSERT INTO alignment_wells (well_id, geojson, status, parcel_id, candidates) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(wid, json.dumps(wells[wid]), a["status"], a["parcel_id"],
+          json.dumps(a["candidates"])) for wid, a in attributions.items()],
+    )
+
+
+@app.post("/v1/alignment")
+def publish_alignment(req: AlignRequest):
+    """对齐发布：把当前版本经仿射变换 + 格点吸附转到外业平面格网。
+
+    对齐副本须通过原有边界有效性与覆盖核查，且所有宗地对接触类型、
+    每口井归属状态与候选宗地均与源版一致；任一不满足即整体拒绝，
+    原有对齐副本继续供数。
+    """
+    # 1) 控制点：源侧/目标侧三点各自不共线
+    src_pts = [tuple(cp.source) for cp in req.control_points]
+    dst_pts = [tuple(cp.target) for cp in req.control_points]
+    cp_reasons = [r for r in (collinear_reason(src_pts, "源侧"),
+                              collinear_reason(dst_pts, "目标侧")) if r]
+    if cp_reasons:
+        return _err(422, {
+            "error": "invalid_control_points",
+            "message": "控制点无法建立仿射变换，原有对齐副本继续供数",
+            "reasons": cp_reasons,
+        })
+
+    # 2) 读取 base 版本快照（版本数据不可变，按修订号读取即是一致快照）
+    conn = connect()
+    try:
+        current = _current_revision(conn)
+        if current is None:
+            return _err(404, {"error": "not_initialized",
+                              "message": "尚未首次提交，请先调用 POST /v1/init"})
+        if req.base_revision != current:
+            return _revision_conflict(
+                current, req.base_revision,
+                f"所见修订号 {req.base_revision} 已过期，当前为 {current}，"
+                "请重新读取后再提交；原有对齐副本继续供数")
+        region_gj = _load_region(conn)
+        parcel_gj = _load_parcels(conn, current)
+        well_gj = _load_well_geoms(conn)
+        src_attributions = _load_attributions(conn, current)
+    finally:
+        conn.close()
+
+    # 3) 仿射变换 + 格点吸附（写事务之外，期间源版可照常发布）
+    matrix = solve_affine(src_pts, dst_pts)
+    spacing = req.grid_spacing
+    aligned_region_gj = transform_polygon_geojson(region_gj, matrix, spacing)
+    aligned_parcel_gj = {pid: transform_polygon_geojson(gj, matrix, spacing)
+                         for pid, gj in parcel_gj.items()}
+    aligned_well_gj = {wid: transform_point_geojson(gj, matrix, spacing)
+                       for wid, gj in well_gj.items()}
+
+    # 4) 对齐副本核查：几何有效性（复用原有规则）
+    reasons: list[dict] = []
+    region_geom, errs = parse_polygon(aligned_region_gj, label="对齐区域")
+    reasons.extend(errs)
+    aligned_geoms: dict[str, Any] = {}
+    for pid in sorted(aligned_parcel_gj):
+        geom, errs = parse_polygon(aligned_parcel_gj[pid], parcel_id=pid,
+                                   label=f"对齐宗地 {pid}")
+        reasons.extend(errs)
+        if geom is not None:
+            aligned_geoms[pid] = geom
+    aligned_well_geoms: dict[str, Any] = {}
+    for wid in sorted(aligned_well_gj):
+        geom, errs = parse_point(aligned_well_gj[wid], well_id=wid,
+                                 label=f"对齐井 {wid}")
+        reasons.extend(errs)
+        if geom is not None:
+            aligned_well_geoms[wid] = geom
+
+    # 5) 覆盖核查（复用原有规则）
+    tiling = None
+    if region_geom is not None and len(aligned_geoms) == len(aligned_parcel_gj):
+        tiling = validate_tiling(aligned_geoms, region_geom)
+        reasons.extend(tiling.reasons)
+
+    # 6) 接触类型一致性：逐宗地对与源版比较
+    if len(aligned_geoms) == len(aligned_parcel_gj):
+        src_geoms = {}
+        for pid, gj in parcel_gj.items():
+            geom, _ = parse_polygon(gj, parcel_id=pid, label=f"宗地 {pid}")
+            src_geoms[pid] = geom
+        reasons.extend(compare_contact_types(src_geoms, aligned_geoms))
+
+    # 7) 井归属一致性：对齐副本重算，逐井与源版比较
+    aligned_attributions = attribute_wells(aligned_well_geoms, aligned_geoms)
+    if (len(aligned_geoms) == len(aligned_parcel_gj)
+            and len(aligned_well_geoms) == len(aligned_well_gj)):
+        reasons.extend(compare_attributions(src_attributions, aligned_attributions))
+
+    if reasons:
+        return _alignment_validation_error(reasons, tiling=tiling)
+
+    # 8) 乐观并发提交：源修订已变更则整体作废，原有对齐副本继续供数
+    control_points = [{"source": list(cp.source), "target": list(cp.target)}
+                      for cp in req.control_points]
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if _current_revision(conn) != req.base_revision:
+                conn.execute("ROLLBACK")
+                return _revision_conflict(
+                    _current_revision(conn), req.base_revision,
+                    "提交对齐结果期间源修订已变更，本次对齐作废，"
+                    "原有对齐副本继续供数")
+            _save_alignment(conn, req, control_points, aligned_region_gj,
+                            aligned_parcel_gj, aligned_well_gj,
+                            aligned_attributions)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+    return {"source_revision": req.base_revision,
+            "grid_spacing": spacing,
+            "parcel_count": len(aligned_parcel_gj),
+            "well_count": len(aligned_well_gj),
+            "well_summary": _well_summary(aligned_attributions)}
+
+
+@app.get("/v1/alignment")
+def get_alignment():
+    """当前对齐副本：完整几何 + 所用修订号、控制点、格网间距（同一读事务取出）。"""
+    conn = connect()
+    try:
+        conn.execute("BEGIN")
+        try:
+            meta = conn.execute(
+                "SELECT source_revision, control_points, grid_spacing, created_at, "
+                "region FROM alignment_meta WHERE id = 1"
+            ).fetchone()
+            if meta is None:
+                conn.execute("ROLLBACK")
+                return _err(404, {"error": "no_alignment",
+                                  "message": "尚未发布对齐副本"})
+            parcel_rows = conn.execute(
+                "SELECT parcel_id, geojson FROM alignment_parcels ORDER BY parcel_id"
+            ).fetchall()
+            well_rows = conn.execute(
+                "SELECT well_id, geojson, status, parcel_id, candidates "
+                "FROM alignment_wells ORDER BY well_id"
+            ).fetchall()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+    return {
+        "source_revision": meta["source_revision"],
+        "control_points": json.loads(meta["control_points"]),
+        "grid_spacing": meta["grid_spacing"],
+        "created_at": meta["created_at"],
+        "region": json.loads(meta["region"]),
+        "parcels": [{"id": r["parcel_id"], "geometry": json.loads(r["geojson"])}
+                    for r in parcel_rows],
+        "wells": [{"id": r["well_id"], "geometry": json.loads(r["geojson"]),
+                   "status": r["status"], "parcel_id": r["parcel_id"],
+                   "candidates": json.loads(r["candidates"])}
+                  for r in well_rows],
+    }
 
 
 # ---------------------------------------------------------------- 查询
